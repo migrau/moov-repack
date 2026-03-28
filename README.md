@@ -12,16 +12,18 @@ This patch removes that dependency so you can keep using your Moov hardware.
 
 | Patch | File | Description |
 |-------|------|-------------|
-| **OfflineHelper** | `smali/cc/moov/patch/OfflineHelper.smali` | New class. On first launch, injects a local user + profile into SharedPreferences so the app thinks you're already logged in. Only runs once — after that, your real data is used. |
-| **App bootstrap** | `smali/cc/moov/main/MoovApplication.smali` | Calls `OfflineHelper.ensureOfflineUser()` during `onCreate()`, before any other component tries to access the user. |
+| **OfflineHelper** | `smali/cc/moov/patch/OfflineHelper.smali` | New class. Creates a User + UserProfile directly in memory using public setters, then calls `setCurrentUser()` which persists to SharedPreferences. Uses numeric userId (`"1000001"`) as required by `User.triggerLogin()`. Only creates if `sCurrentUser` is null. |
+| **Skip login** | `smali/cc/moov/main/LaunchActivity$1.smali` | `run()` always navigates to `MainTabbedActivity`, bypassing the `getCurrentUser()` / `isComplete()` check that would redirect to the login screen. |
+| **Null user handler** | `smali/cc/moov/main/MainTabbedActivity.smali` | When `getCurrentUser()` returns null in `onCreate()`, calls `OfflineHelper.ensureOfflineUser()` instead of restarting the app via `gotoTheFirstPlace()` (which caused an infinite restart loop). |
+| **Field visibility** | `smali/cc/moov/sharedlib/onboarding/User.smali` | `sCurrentUser` and `mUserProfile` changed from `protected` to `public`. ART (Android Runtime) enforces access checks across packages, unlike desktop JVMs. |
 | **Server reachability** | `smali/cc/moov/common/network/Reachability.smali` | `isOurServerReachable()` always returns `true`, preventing server-down error dialogs. |
-| **Profile sync** | `smali/cc/moov/sharedlib/onboarding/UserProfileApiHelper.smali` | `uploadToServer()` and `fetchDictFromServer()` are now no-ops. They call completion handlers with success/error so the app continues normally, but never hit the network. |
+| **Profile sync** | `smali/cc/moov/sharedlib/onboarding/UserProfileApiHelper.smali` | `uploadToServer()` and `fetchDictFromServer()` are no-ops. `uploadToServer()` passes the real `UserProfile` object to the `onFinish` callback (not null) to prevent `NullPointerException` when `SettingsActivity` calls `.save()`. |
 
 ### What's NOT patched
 
 - **Bluetooth / sensor logic**: Untouched. All workout processing (HR, cadence, pace, swimming laps, boxing punches) runs locally in `libbridge.so` and was never server-dependent.
 - **Local storage**: Untouched. Workouts are saved to the local SQLite database (ActiveAndroid) as they always were.
-- **Settings/profile UI**: Untouched. You can change height, weight, gender, name, etc. from the app's settings — changes save to SharedPreferences locally.
+- **Settings/profile UI**: Untouched. You can change height, weight, gender, name, etc. from the app's settings — changes persist to SharedPreferences locally.
 - **Other network calls**: The `UploadQueue` and other sync mechanisms will silently fail (no server to talk to) but won't crash the app. Workout data stays on-device.
 
 ## Installation
@@ -99,16 +101,14 @@ adb logcat | grep -iE "moov|offline|fatal|crash"
 ```
 The `OfflineHelper` logs to logcat with tag `OfflineHelper` — look for "Creating offline user..." and "Offline user created OK".
 
-### App opens but shows login screen
-The offline user wasn't created. Possible causes:
-- SharedPreferences write failed (storage full?)
-- The app was updated over the original (different signature). Uninstall completely and reinstall.
-
-### App works but shows "no connection" warnings
+### App shows "no connection" warnings
 These are cosmetic — the app still functions. The `isOurServerReachable` patch prevents blocking dialogs, but some UI elements may still show connectivity warnings.
 
+### App crashes when saving settings
+If you see `NullPointerException` on `UserProfile.save()`, the `uploadToServer` patch may need updating. Check that it passes the real `UserProfile` to the `onFinish` callback.
+
 ### Workouts don't save
-Workout data is processed and saved locally in SQLite by `libbridge.so`. If workouts aren't saving, it's likely a different issue (Bluetooth connection to the wristband, permissions, etc.) and not related to this patch.
+Workout data is processed and saved locally in SQLite by `libbridge.so`. If workouts aren't saving, it's likely a Bluetooth connection issue with the wristband, not related to this patch.
 
 ### Want to reset to the default offline user
 Clear the app's data: Settings → Apps → Moov Coach → Storage → Clear Data. On next launch, the OfflineHelper will create a fresh default profile.
@@ -134,10 +134,16 @@ Clear the app's data: Settings → Apps → Moov Coach → Storage → Clear Dat
 ### Key discovery: the app is offline-capable by design
 The heavy lifting (sensor data processing, real-time coaching, workout reports) all runs locally in `libbridge.so`. The server was only used for:
 - Authentication (login/register) → **patched out**
-- Profile sync → **patched out**
+- Profile sync → **patched out (no-op with real callback)**
 - Workout cloud backup → **fails silently, data stays local**
 - Social features (Firebase) → **fails silently**
 - Firmware updates → **no longer relevant**
+
+### Lessons learned during patching
+- **ART is stricter than JVM**: `protected` fields are not accessible cross-package at runtime, even though smali/bytecode allows it at compile time. Fields accessed from `cc.moov.patch` must be `public` in `cc.moov.sharedlib.onboarding`.
+- **userId must be numeric**: `User.triggerLogin()` calls `Long.valueOf(userId)` — string IDs cause `NumberFormatException`.
+- **Context timing matters**: `ApplicationContextReference.getContext()` returns null during `MoovApplication.onCreate()` before `setContext()` is called. The OfflineHelper must run later (e.g., in `MainTabbedActivity.onCreate()`).
+- **Callback parameters matter**: `uploadToServer`'s `onFinish(boolean, UserProfile, int)` must receive the real `UserProfile`, not null — otherwise `SettingsActivity.onPause()` crashes when calling `.save()` on the returned profile.
 
 ### Original API endpoints (for reference)
 These are the endpoints the original app called on `https://muscle.moov.cc`:
@@ -159,3 +165,5 @@ Authentication used the `X-Moov-Api-Session` header with a session ID, plus `MOO
 ## License
 
 This patch is provided for personal use to restore functionality of hardware you own. The original Moov Coach app is property of Moov Inc. (defunct).
+
+Generated by Opus4.6
